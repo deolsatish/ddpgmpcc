@@ -4,22 +4,26 @@
 #include <net/mptcp.h>
 
 
+#include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/module.h>
 #include <linux/fs.h>
-#include <linux/mm.h>
-#include <linux/gfp.h>          // alloc_page
-#include <linux/miscdevice.h>   // miscdevice misc_xxx
-#include <linux/uaccess.h>      // copy_from/to_user 
-
-#define DEMO_NAME "demo_dev"
-#define PAGE_ORDER 2
-#define MAX_SIZE (PAGE_SIZE << PAGE_ORDER)
-
-
+#include <linux/debugfs.h>
+#include <linux/slab.h>
+#include <linux/version.h>
+#include <linux/mm.h>  /* mmap related stuff */
 
 #define MBPS (1024 * 1024 / 8)
 #define PCC_INTERVALS 4
+
+
+
+
+
+/* In the probing stage The goal of this state is to determine whether the sending
+rate should be increased or decreased, and to what extent, To this end,
+the gradient of the subflow-specific utility function at the current
+sending rate r is evaluated by testing a higher rate r + ω and a
+lower rate r − ω*/
 
 /* Probing changes rate by 5% up and down of current rate. */
 #define PCC_PROBING_EPS 5
@@ -66,8 +70,8 @@
 enum PCC_DECISION
 {
 	PCC_RATE_UP = 0,
-	PCC_RATE_DOWN,
-	PCC_RATE_STAY,
+	PCC_RATE_DOWN, // value wil be 1
+	PCC_RATE_STAY, // value wil be 2
 };
 
 struct pcc_interval
@@ -83,7 +87,7 @@ struct pcc_interval
 	s64 start_rtt; /* smoothed RTT at start and end of this interval */
 	s64 end_rtt;
 
-	u32 packets_sent_base; /* packets sent before this interval started */
+	u32 packets_sent_base;/* packets sent before this interval started */ /* index of interval currently being sent */ 
 	u32 packets_ended;	 
 
 	s64 utility;   /* observed utility of this interval */
@@ -146,7 +150,10 @@ static s64 mpcc_get_others_rate(struct sock *sk)
 {
 	struct mptcp_tcp_sock *mptcp_sk;
 	struct tcp_sock *tp = tcp_sk(sk);
-	struct pcc_data *pcc = inet_csk_ca(sk);
+	/*Connection-oriented sockets (struct inet_connection_sock) contain a fixed amount of space for congestion control state in icsk_ca_priv.
+	 inet_csk_ca(sk) gets a pointer to this space given a socket
+	*/
+	struct pcc_data *pcc = inet_csk_ca(sk); 
 	const struct mptcp_cb *mpcb = tp->mpcb;
 	s64 total_rate = 0;
 
@@ -154,11 +161,16 @@ static s64 mpcc_get_others_rate(struct sock *sk)
 	{
 		return 0;
 	}
+	/* The second
+building block is the Multi-path control bock (mpcb). This building block
+supervises the multiple flows used in a given connection */
 	mptcp_for_each_sub(mpcb, mptcp_sk)
 	{
-		struct sock *curr_sk = mptcp_to_sock(mptcp_sk);
+		struct sock *curr_sk = mptcp_to_sock(mptcp_sk); 
 		//struct tcp_sock *curr_tp = tcp_sk(curr_sk);
 		struct pcc_data *curr_pcc = inet_csk_ca(curr_sk);
+
+		// If the subflow in the loop is not same as the one sent in teh function, then we add it to  total_rate
 		if (curr_pcc != pcc)
 		{
 			total_rate += curr_pcc->advertised_rate;
@@ -175,8 +187,9 @@ static u32 pcc_get_rtt(struct tcp_sock *tp)
 	 */
 	if (tp->srtt_us)
 	{
-		return max(tp->srtt_us >> 3, 1U);
+		return max(tp->srtt_us >> 3, 1U);  // if RTT is less than 1U then RTT is 1U
 	}
+	//If the smooth round trip time is zero, rtt_us uses the default USEC_PER_MSEC(1000)
 	else
 	{
 		return USEC_PER_MSEC;
@@ -189,9 +202,9 @@ static void pcc_set_cwnd(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
-	u64 cwnd = sk->sk_pacing_rate;
+	u64 cwnd = sk->sk_pacing_rate; // socket pacing rate
 	cwnd *= pcc_get_rtt(tcp_sk(sk));
-	cwnd /= tp->mss_cache;
+	cwnd /= tp->mss_cache; //tp → mss_cache = 536 (cached effective maximum segment size for the connection)
 
 	cwnd /= USEC_PER_SEC;
 	//cwnd += 2;
@@ -199,7 +212,11 @@ static void pcc_set_cwnd(struct sock *sk)
 
 	//cwnd = 9000;
 
+	//4 Unsigned long long
+	// CWND supports atleast 4 packets
+
 	cwnd = max(4ULL, cwnd);
+	// snd_cwnd_clamp /* Do not allow snd_cwnd to grow above this */
 	cwnd = min((u32)cwnd, tp->snd_cwnd_clamp); /* apply cap */
 	tp->snd_cwnd = cwnd;
 }
@@ -225,10 +242,10 @@ static void pcc_setup_intervals_probing(struct sock *sk, struct pcc_data *pcc)
 	get_random_bytes(&rand, 1);
 	//if (rand & 1)
 		pcc->others_rate = mpcc_get_others_rate(sk);
-	rate_diff = (pcc->rate + pcc->others_rate);
+	rate_diff = (pcc->rate + pcc->others_rate); // This makes it total rate
 	rate_diff /= PCC_PROBING_EPS_PART;
-	rate_diff *= PCC_PROBING_EPS;
-	rate_diff += (pcc->rate / PCC_PROBING_EPS_PART) * pcc->decisions_count;
+	rate_diff *= PCC_PROBING_EPS; // This is bascialyy like multiplying it by 5/100 or 5 %
+	rate_diff += (pcc->rate / PCC_PROBING_EPS_PART) * pcc->decisions_count; // 5%of total rate + (pcc->rate)/100*decision_count
 
 	get_random_bytes(&rand, 1);
 	rate_high = pcc->rate + rate_diff;
@@ -260,8 +277,10 @@ static void pcc_setup_intervals_probing(struct sock *sk, struct pcc_data *pcc)
 
 		pcc->intervals[i].packets_sent_base = 0;
 		pcc->intervals[i + 1].packets_sent_base = 0;
+		// Basically We are inserting rates for the next 4 RTT, because our PCC_INTERVAL is 4
 	}
 
+	// Extremely Important
 	pcc->send_index = 0;
 	pcc->recive_index = 0;
 	pcc->wait = false;
@@ -293,23 +312,24 @@ static void start_interval(struct sock *sk, struct pcc_data *pcc)
 
 	if (!pcc->wait)
 	{
-		interval = &pcc->intervals[pcc->send_index];
+		interval = &pcc->intervals[pcc->send_index]; /* index of interval currently being sent */
 		interval->packets_ended = 0;
 		interval->lost = 0;
 		interval->delivered = 0;
-		interval->packets_sent_base = tcp_sk(sk)->data_segs_out;
+		// data_segs_out - total number of data segments sent.
+		interval->packets_sent_base = tcp_sk(sk)->data_segs_out; /* index of interval currently being sent */
 		interval->packets_sent_base = max(interval->packets_sent_base, 1U);
-		interval->send_start = tcp_sk(sk)->tcp_mstamp;
+		interval->send_start = tcp_sk(sk)->tcp_mstamp; // tcp_mstamp -/* most recent packet received/sent */
 		rate = interval->rate;
 		interval->throughput = 0;
 		interval->bytes_lost = 0;
-		interval->start_seq = tcp_sk(sk)->snd_nxt;
+		interval->start_seq = tcp_sk(sk)->snd_nxt; //snd_nxt;	/* Next sequence we send*/
 		interval->end_seq = 0;
 		interval->send_ended = false;
 		interval->last_known_seq = interval->start_seq - 1;
 		interval->loss_ratio = 0;
 		interval->packets_sent = 0;
-		interval->start_rtt = tcp_sk(sk)->srtt_us >> 3;
+		interval->start_rtt = tcp_sk(sk)->srtt_us >> 3; //srtt_us;	/* smoothed round trip time << 3 in usecs */
 		interval->send_end_time = 3 * (tcp_sk(sk)->srtt_us >> 3) / 2;
 		interval->timeout = ((tcp_sk(sk)->srtt_us >> 3) * 5) / 2;
 	}
@@ -317,7 +337,7 @@ static void start_interval(struct sock *sk, struct pcc_data *pcc)
 	//rate = max(rate, PCC_RATE_MIN);
 	if (rate < PCC_RATE_MIN)
 		rate = PCC_RATE_MIN;
-	rate = min(rate, sk->sk_max_pacing_rate);
+	rate = min(rate, sk->sk_max_pacing_rate); // sk_max_pacing rate is the max rate for the socket
 	sk->sk_pacing_rate = rate;
 	pcc_set_cwnd(sk);
 	DBG_PRINT(KERN_INFO "%hhu: starting interval with rate %u (%u)\n", pcc->id, rate, TO_MPBPS(rate));
@@ -344,6 +364,8 @@ static s64 pcc_calc_util_grad(s64 rate_1, s64 util_1, s64 rate_2, s64 util_2)
 #define FIXEDPT_WBITS 40
 #define OMIT_STDINT
 #include "fixedptc.h"
+
+
 static void pcc_calc_utility_vivace(struct pcc_data *pcc, struct pcc_interval *interval, struct sock *sk)
 {
 	s64 delivered, lost, mss, rate, throughput, util;
@@ -358,7 +380,7 @@ static void pcc_calc_utility_vivace(struct pcc_data *pcc, struct pcc_interval *i
 	s64 rtt_diff_thresh = 0;
 	u64 bytes_sent = interval->end_seq;
 	s64 loss_part = 0;
-	u32 packets_sent = (interval->end_seq - interval->start_seq) / tcp_sk(sk)->mss_cache;
+	u32 packets_sent = (interval->end_seq - interval->start_seq) / tcp_sk(sk)->mss_cache; //tp → mss_cache = 536 (cached effective maximum segment size for the connection)
 
 	interval->utility = 0;
 	interval->packets_sent = packets_sent;
@@ -369,6 +391,8 @@ static void pcc_calc_utility_vivace(struct pcc_data *pcc, struct pcc_interval *i
 	rate = interval->rate;
 	throughput = 0;
 	bytes_sent = packets_sent * mss;
+
+	// Calculating throughput
 	if (send_dur > 0)
 		throughput = (USEC_PER_SEC * bytes_sent) / send_dur;
 	if (recv_dur > 0)
@@ -386,7 +410,7 @@ static void pcc_calc_utility_vivace(struct pcc_data *pcc, struct pcc_interval *i
     if (throughput  > 0)
 	    rtt_diff_thresh = (2 * USEC_PER_SEC * mss) / throughput;
 	if (send_dur > 0)
-		lat_infl = (PCC_SCALE * rtt_diff) / (send_dur);
+		lat_infl = (PCC_SCALE * rtt_diff) / (send_dur); //ltt_infl is latency inflation
 	//lat_infl = 2 * (PCC_SCALE * rtt_diff) / (interval->end_rtt + interval->start_rtt);
 	//lat_infl = rtt_diff / USEC_PER_MSEC;
 	
@@ -398,7 +422,7 @@ static void pcc_calc_utility_vivace(struct pcc_data *pcc, struct pcc_interval *i
 	//if (rtt_diff < rtt_diff_thresh && rtt_diff > -1 * rtt_diff_thresh)
 	//	lat_infl = 0;
 
-	if (lat_infl < PCC_LAT_INFL_FILTER && lat_infl > -1 * PCC_LAT_INFL_FILTER)
+	if (lat_infl < PCC_LAT_INFL_FILTER && lat_infl > -1 * PCC_LAT_INFL_FILTER) //if latency inflation is less than 5 %
 		lat_infl = 0;
 	
 	if (lat_infl < 0 && pcc->start_mode)
@@ -446,7 +470,7 @@ static void pcc_calc_utility_vivace(struct pcc_data *pcc, struct pcc_interval *i
 }
 
 static enum PCC_DECISION
-pcc_get_decision(struct pcc_data *pcc, u32 new_rate)
+pcc_get_decision(struct pcc_data *pcc, u32 new_rate) // Tels what direction the rate was changed
 {
 	if (pcc->rate == new_rate)
 		return PCC_RATE_STAY;
@@ -469,7 +493,7 @@ static s64 pcc_decide_rate(struct pcc_data *pcc)
 	run_2_res = pcc->intervals[2].utility > pcc->intervals[3].utility;
 
 	/* did_agree: was the 2 sets of intervals with the same result */
-	did_agree = !((run_1_res == run_2_res) ^
+	did_agree = !((run_1_res == run_2_res)
 				  (pcc->intervals[0].rate == pcc->intervals[2].rate));
 
 	grad_2 = pcc_calc_util_grad(pcc->intervals[2].rate, pcc->intervals[2].utility, pcc->intervals[3].rate, pcc->intervals[3].utility);
@@ -736,7 +760,7 @@ static void pcc_decide(struct pcc_data *pcc, struct sock *sk)
 		DBG_PRINT(KERN_INFO "%hhu decide: nrate dir: %d rate: %llu grad: %lld step: %lld dcount: (%hhu)\n",
 			   pcc->id, pcc->rate < new_rate, (new_rate * 8) / (1024 * 1024), grad, rate_change,
 			   pcc->decisions_count);
-		pcc->rate = new_rate;
+		pcc->rate = new_rate; // Very important change here
 		pcc_setup_intervals_moving(pcc);
 		pcc->moving = true;
 		pcc->decisions_count = 0;
@@ -773,7 +797,7 @@ static u32 pcc_decide_rate_moving(struct sock *sk, struct pcc_data *pcc)
 	if (grad == 0) {
 		return pcc->rate;
 	}
-	rate_change = pcc_convert_gradient_to_step(pcc, grad);
+	rate_change = min(pcc_convert_gradient_to_step(pcc, grad), ddpg(pcc,grad));
 	new_rate = pcc->rate + rate_change;
 	
 	new_rate = pcc->rate + rate_change;
@@ -804,7 +828,7 @@ static void pcc_decide_moving(struct sock *sk, struct pcc_data *pcc)
 		start_interval(sk, pcc);
 		return;
 	}
-	if (decision != last_decision)
+	if (decision != last_decision) // if decision has changed then we start probing or we willcontinue moving in the same direction
 	{
 
 #ifdef USE_PROBING
@@ -827,6 +851,10 @@ static void pcc_decide_moving(struct sock *sk, struct pcc_data *pcc)
 /* Double target rate until the link utility doesn't increase accordingly. Then,
  * cut the rate in half and change to the gradient ascent moving stage.
  */
+/* Vivace’s rate control begins with a slow start phase in
+ * which the sender doubles sending rate every MI and permanently exits slow start when its empirically-derived
+ * utility value decreases for the first time. It then enters
+ * the online learning phase*/
 static void pcc_decide_slow_start(struct sock *sk, struct pcc_data *pcc)
 {
 	struct pcc_interval *interval = &pcc->intervals[0];
@@ -954,14 +982,14 @@ static void start_next_send_interval(struct sock *sk, struct pcc_data *pcc)
  */
 static void update_current_interval_sequences(struct sock* sk, struct pcc_interval* interval)
 {
-	interval->end_seq = tcp_sk(sk)->snd_nxt;
+	interval->end_seq = tcp_sk(sk)->snd_nxt; //snd_nxt;	/* Next sequence we send*/
 }
 
 static void update_interval_sack(struct sock* sk, struct pcc_data *pcc)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	int i,j;
-	struct tcp_sack_block sack_cache[4];
+	struct tcp_sack_block sack_cache[4]; // /* This defines a selective acknowledgement block. */
 
 	//sort received sacks according to sequence in increasing order
 	if (tp->sacked_out) {
@@ -988,7 +1016,7 @@ static void update_interval_sack(struct sock* sk, struct pcc_data *pcc)
 
 		//set the last known sequence to the last cumulative ack if it is better than the last known seq
 		if (after(tp->snd_una, loop_mon->last_known_seq)) {
-			loop_mon->last_known_seq = tp->snd_una;
+			loop_mon->last_known_seq = tp->snd_una; //snd_una;	/* First byte we want an ack for	*/
 		}
 
 		//there are sacks
@@ -1044,9 +1072,7 @@ static void update_interval_sack(struct sock* sk, struct pcc_data *pcc)
 	}
 
 }
-static void
-pcc_update_interval(struct pcc_interval *interval, struct pcc_data *pcc,
-					struct sock *sk)
+static void pcc_update_interval(struct pcc_interval *interval, struct pcc_data *pcc,struct sock *sk)
 {
 	//	if (pcc_interval_in_ignore(interval))
 	//		return;
@@ -1060,9 +1086,16 @@ pcc_update_interval(struct pcc_interval *interval, struct pcc_data *pcc,
 		interval->start_rtt = tcp_sk(sk)->srtt_us >> 3;
 	}
 
-	interval->lost += tcp_sk(sk)->lost - pcc->lost_base;
+	interval->lost += tcp_sk(sk)->lost - pcc->lost_base; // Because we need it for current interval
 	interval->delivered += tcp_sk(sk)->delivered - pcc->delivered_base;
 }
+
+
+
+
+
+
+
 
 /* Updates the PCC model */
 static void pcc_process(struct sock *sk)
@@ -1079,7 +1112,7 @@ static void pcc_process(struct sock *sk)
 	//	return;
 
 	pcc_set_cwnd(sk);
-	if (!pcc->wait)
+	if (!pcc->wait) // if wait is false then condition is true
 	{
 		interval = &pcc->intervals[pcc->send_index];
 		update_current_interval_sequences(sk, interval);
@@ -1107,161 +1140,172 @@ static void pcc_process(struct sock *sk)
 }
 
 
-static struct device *mydemodrv_device;
-static struct page *page = NULL;
-static char *device_buffer = NULL;
 
-static int demodrv_open(struct inode *inode, struct file *file)
-{
-   struct mm_struct *mm = current->mm;
-   int major = MAJOR(inode->i_rdev);
-   int minor = MINOR(inode->i_rdev);
-
-   printk("%s: major=%d, minor=%d\n", __func__, major, minor);
+/* Memory mapping: provides user programs with direct access to device memory
+ * Mapped area must be multiple of PAGE_SIZE, and starting address aligned to
+ * PAGE_SIZE
+ *
+ * syscall: mmap(caddr_t addr, size_t len, int ptro, int flags, int fd, off_t off)
+ * file operation: int (*mmap)(struct file *f, struct vm_area_struct *vma)
+ *
+ * Driver needs to: build page tables for address range, and replace vma->vm_ops 
+ * Building page tables:
+ *    - all at once: remap_page_range
+ *    - one page at a time: nopage method. Finds correct page for address, and 
+ *      increments its reference cout. Must be implemented if driver supports
+ *      mremap syscall
+ *
+ * fields in struct vm_area_struct:
+ *     unsigned long vm_start, vm_end: virtual address range covered
+ *                   by VMA
+ *     struct file *vm_file: file associated with VMA
+ *     struct vm_operations_struct *vm_ops: functions that kernel
+ *                   will invoke to operate in VMA
+ *     void *vm_private_data: used by driver to store its own information
+ *
+ * VMA operations:
+ *     void (*open)(struct vm_area_struct *vma): invoked when a new reference
+ *                   to the VMA is made, except when the VMA is first created,
+ *                   when mmap is called
+ *     struct page *(*nopage)(struct vm_area_struct *area,
+ *                            unsigned long address, int write_access): 
+ *                   invoked by page fault handler when process tries to access 
+ *                   valid page in VMA, but not currently in memory
+ */
  
-   printk("client: %s (%d)\n", current->comm, current->pid);
-   printk("code  section: [0x%lx   0x%lx]\n", mm->start_code, mm->end_code);
-   printk("data  section: [0x%lx   0x%lx]\n", mm->start_data, mm->end_data);
-   printk("brk   section: s: 0x%lx, c: 0x%lx\n", mm->start_brk, mm->brk);
-   printk("mmap  section: s: 0x%lx\n", mm->mmap_base);
-   printk("stack section: s: 0x%lx\n", mm->start_stack);
-   printk("arg   section: [0x%lx   0x%lx]\n", mm->arg_start, mm->arg_end);
-   printk("env   section: [0x%lx   0x%lx]\n", mm->env_start, mm->env_end);
-
-   return 0;
-}
-
-static int demodrv_release(struct inode *inode, struct file *file)
+#define DEV_NAME "mmap_example"
+#define PRINTFUNC() printk(KERN_ALERT DEV_NAME ": %s called\n", __func__)
+#define PRINT(a) printk(KERN_ALERT DEV_NAME ": %s: %s\n", __func__, a)
+ 
+struct dentry  *file1;
+ 
+struct mmap_info {
+    char *data; /* the data */
+    int reference;       /* how many times it is mmapped */    
+};
+ 
+ 
+ 
+/* keep track of how many times it is mmapped */
+void mmap_open(struct vm_area_struct *vma)
 {
+    struct mmap_info *info = (struct mmap_info *)vma->vm_private_data;
+    info->reference++;
+}
+ 
+/* decrement reference cout */
+void mmap_close(struct vm_area_struct *vma)
+{
+    struct mmap_info *info = (struct mmap_info *)vma->vm_private_data;
+    info->reference--;
+}
+ 
+/* nopage is called the first time a memory area is accessed which is not in memory,
+ * it does the actual mapping between kernel and user space memory
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0)
+struct page *mmap_nopage(struct vm_area_struct *vma, unsigned long address, int *type)
+#else
+int mmap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+#endif
+{
+    struct page *page;
+    struct mmap_info *info;
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,0)
+        unsigned long address = (unsigned long)vmf->virtual_address;
+#endif
+        PRINTFUNC();
+    /* is the address valid? */
+    if (address > vma->vm_end) {
+        PRINT("invalid address");
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0)
+        return NOPAGE_SIGBUS;
+#else
+                return VM_FAULT_SIGBUS;
+#endif
+    }
+    /* the data is in vma->vm_private_data */
+    info = (struct mmap_info *)vma->vm_private_data;
+    if (!info->data) {
+        PRINT("no data");
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0)
+        return NOPAGE_OOM;  
+#else
+                return VM_FAULT_SIGBUS;
+#endif
+    }
+ 
+    /* get the page */
+    page = virt_to_page(info->data);
+     
+    /* increment the reference count of this page */
+    get_page(page);
+    /* type is the page fault type */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0)
+    if (type)
+        *type = VM_FAULT_MINOR;
+    return page;
+#else
+        vmf->page = page;
+        return 0;
+#endif
+}
+ 
+struct vm_operations_struct mmap_vm_ops = {
+    .open =     mmap_open,
+    .close =    mmap_close,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0)
+    .nopage =   mmap_nopage,
+#else
+        .fault =    mmap_fault,
+#endif
+};
+ 
+int my_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    PRINTFUNC();
+    vma->vm_ops = &mmap_vm_ops;
+    vma->vm_flags |= VM_RESERVED;
+    /* assign the file private data to the vm private data */
+    vma->vm_private_data = filp->private_data;
+    mmap_open(vma);
     return 0;
 }
-
-static ssize_t
-demodrv_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+ 
+int my_close(struct inode *inode, struct file *filp)
 {
-    int actual_readed;
-    int max_read;
-    int need_read;
-    int ret;
-    max_read = PAGE_SIZE - *ppos;
-    need_read = max_read > count ? count : max_read;
-    if (need_read == 0)
-        dev_warn(mydemodrv_device, "no space for read");
-
-    ret = copy_to_user(buf, device_buffer + *ppos, need_read);
-    if (ret == need_read)
-        return -EFAULT;
-    actual_readed = need_read - ret;
-    *ppos += actual_readed;
-
-    printk("%s actual_readed=%d, pos=%lld\n", __func__, actual_readed, *ppos);
-    return actual_readed;
+    struct mmap_info *info = filp->private_data;
+        PRINTFUNC();
+    free_page((unsigned long)info->data);
+        kfree(info);
+    filp->private_data = NULL;
+    return 0;
 }
-
-static ssize_t
-demodrv_write(struct file *file, const char __user *buf, size_t count,
-              loff_t *ppos)
+ 
+int my_open(struct inode *inode, struct file *filp)
 {
-    int actual_written;
-    int max_write;
-    int need_write;
-    int ret;
-    max_write = PAGE_SIZE - *ppos;
-    need_write = max_write > count ? count : max_write;
-    if (need_write == 0)
-        dev_warn(mydemodrv_device, "no space for write");
-
-    ret = copy_from_user(device_buffer + *ppos, buf, need_write);
-    if (ret == need_write)
-        return -EFAULT;
-    actual_written = need_write - ret;
-    *ppos += actual_written;
-
-    printk("%s actual_written=%d, pos=%lld\n", __func__, actual_written, *ppos);
-    return actual_written;
+    struct mmap_info *info;
+        PRINTFUNC();
+ 
+        info = kmalloc(sizeof(struct mmap_info), GFP_KERNEL);
+    /* obtain new memory */
+        info->data = (char *)get_zeroed_page(GFP_KERNEL);
+    /* writing something to it */
+    memcpy(info->data, "hello from kernel this is file: ", 32);
+    memcpy(info->data + 32, filp->f_dentry->d_name.name,
+           strlen(filp->f_dentry->d_name.name));
+    /* assign this info struct to the file */
+    filp->private_data = info;
+    return 0;
 }
-
-static int demodev_mmap(struct file *file, struct vm_area_struct *vma)
-{
-    struct mm_struct *mm;
-    unsigned long size;
-    unsigned long pfn_start;
-    void *virt_start;
-    int ret;
-
-    mm = current->mm;
-    pfn_start = page_to_pfn(page) + vma->vm_pgoff;
-    virt_start = page_address(page) + (vma->vm_pgoff << PAGE_SHIFT);
-
-    /* 映射大小不超过实际物理页 */
-    size = min(((1 << PAGE_ORDER) - vma->vm_pgoff) << PAGE_SHIFT,
-               vma->vm_end - vma->vm_start);
-
-    printk("phys_start: 0x%lx, offset: 0x%lx, vma_size: 0x%lx, map size:0x%lx\n",
-           pfn_start << PAGE_SHIFT, vma->vm_pgoff << PAGE_SHIFT,
-           vma->vm_end - vma->vm_start, size);
-
-    if (size <= 0) {
-        printk("%s: offset 0x%lx too large, max size is 0x%lx\n", __func__,
-               vma->vm_pgoff << PAGE_SHIFT, MAX_SIZE);
-        return -EINVAL;
-    }
-
-    // 外层vm_mmap_pgoff已经用信号量保护了 
-    // down_read(&mm->mmap_sem);
-    ret = remap_pfn_range(vma, vma->vm_start, pfn_start, size, vma->vm_page_prot);
-    // up_read(&mm->mmap_sem);
-
-    if (ret) {
-        printk("remap_pfn_range failed, vm_start: 0x%lx\n", vma->vm_start);
-    }
-    else {
-        printk("map kernel 0x%px to user 0x%lx, size: 0x%lx\n",
-               virt_start, vma->vm_start, size);
-    }
-
-    return ret;
-}
-
-
-static loff_t demodev_llseek(struct file *file, loff_t offset, int whence)
-{
-    loff_t pos;
-    switch(whence) {
-    case 0: /* SEEK_SET */
-        pos = offset;
-        break;
-    case 1: /* SEEK_CUR */
-        pos = file->f_pos + offset;
-        break;
-    case 2: /* SEEK_END */
-        pos = MAX_SIZE + offset;
-        break;
-    default:
-        return -EINVAL;
-    }
-    if (pos < 0 || pos > MAX_SIZE)
-        return -EINVAL;
-
-    file->f_pos = pos; 
-    return pos;
-}
-
-static const struct file_operations demodrv_fops = {
-    .owner      = THIS_MODULE,
-    .open       = demodrv_open,
-    .release    = demodrv_release,
-    .read       = demodrv_read,
-    .write      = demodrv_write,
-    .mmap       = demodev_mmap,
-    .llseek     = demodev_llseek
+ 
+static const struct file_operations my_fops = {
+    .open = my_open,
+    .release = my_close,
+    .mmap = my_mmap,
 };
 
-static struct miscdevice mydemodrv_misc_device = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = DEMO_NAME,
-    .fops = &demodrv_fops,
-};
+
 
 static void pcc_process_sample(struct sock *sk, const struct rate_sample *rs)
 {
@@ -1285,6 +1329,7 @@ static void pcc_init(struct sock *sk)
 	pcc->id = id;
 	pcc->amplifier = PCC_AMP_MIN;
 	pcc->change_bound = PCC_MIN_CHANGE_BOUND;
+	//https://www.kernel.org/doc/html/latest/core-api/memory-allocation.html for kzalloc
 	pcc->decision_history = kzalloc(sizeof(enum PCC_DECISION) * DECISION_HISTORY_SIZE, GFP_KERNEL);
 	//pcc->rate = 10 * 1024 * 1024 / 8;
 	pcc->rate = 500000;
@@ -1305,27 +1350,8 @@ static void pcc_init(struct sock *sk)
 	start_interval(sk, pcc);
 
 
-	int ret;
-
-    ret = misc_register(&mydemodrv_misc_device);
-    if (ret) {
-        printk("failed to register misc device");
-        return ret;
-    }
-
-    mydemodrv_device = mydemodrv_misc_device.this_device;
-
-    printk("succeeded register misc device: %s\n", DEMO_NAME);
-
-    page = alloc_pages(GFP_KERNEL, PAGE_ORDER);
-    if (!page) {
-        printk("alloc_page failed\n");
-        return -ENOMEM;
-    }
-    device_buffer = 99;
-    printk("device_buffer physical address: %lx, virtual address: %px\n",
-           page_to_pfn(page) << PAGE_SHIFT, device_buffer);
-
+	PRINTFUNC();
+    file1 = debugfs_create_file(DEV_NAME, 0644, NULL, NULL, &my_fops);
 
 
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
@@ -1335,14 +1361,11 @@ static void pcc_init(struct sock *sk)
 static void pcc_release(struct sock *sk)
 {
 	struct pcc_data *pcc = inet_csk_ca(sk);
+	PRINTFUNC();
+    debugfs_remove(file1);
 
 	kfree(pcc->intervals);
 	kfree(pcc->decision_history);
-	printk("removing device\n");
-    
-    __free_pages(page, PAGE_ORDER);
-
-    misc_deregister(&mydemodrv_misc_device);
 }
 
 /* PCC does not need to undo the cwnd since it does not
@@ -1456,9 +1479,6 @@ static struct tcp_congestion_ops tcp_pcc_cong_ops __read_mostly = {
 	.cwnd_event = pcc_cwnd_event,
 };
 
-
-
-
 /* Kernel module section */
 
 static int __init pcc_register(void)
@@ -1471,6 +1491,7 @@ static int __init pcc_register(void)
 static void __exit pcc_unregister(void)
 {
 	tcp_unregister_congestion_control(&tcp_pcc_cong_ops);
+	
 }
 
 module_init(pcc_register);
